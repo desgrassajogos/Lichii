@@ -328,7 +328,7 @@ u32 Maxwell3D::GetMaxStreamVertices() {
                                     ? regs.NativeVertexStreamSize(index)
                                     : regs.vertex_stream_limits[index].Address() + 1 -
                                           array.Address();
-        num_vertices = (std::max)(num_vertices, Common::DivCeil<u64>(stream_size, stride));
+        num_vertices = (std::max)(num_vertices, (stream_size + stride - 1) / stride);
     }
     return static_cast<u32>((std::min<u64>)(num_vertices, (std::numeric_limits<u32>::max)()));
 }

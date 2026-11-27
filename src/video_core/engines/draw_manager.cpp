@@ -11,6 +11,7 @@
 #include "common/settings.h"
 #include "video_core/dirty_flags.h"
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/memory_manager.h"
 #include "video_core/nx2_list_indexed_draw.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/render_trace.h"
