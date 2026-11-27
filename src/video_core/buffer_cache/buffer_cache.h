@@ -2039,6 +2039,38 @@ bool BufferCache<P>::BindGraphicsStorageBuffer(size_t stage, size_t ssbo_index, 
                        cbuf_offset >= nvn_slots && cbuf_offset < nvn_slots + 0x100 &&
                        (cbuf_offset - nvn_slots) % 0x10 == 0 && cbuf.enabled &&
                        cbuf.size >= cbuf_offset + 2 * sizeof(u64);
+    const u32 memo_flags =
+        (is_written ? 1U : 0U) | (native ? 2U : 0U) | (sized ? 4U : 0U);
+    SsboSlotMemo& memo = ssbo_slot_memos[stage][ssbo_index];
+    if (!indirect && !Nx2Perf::Verify()) {
+        const bool reads_size = !native || sized;
+        const size_t read_bytes = reads_size ? 16 : 8;
+        const u64 host_serial = gpu_memory->HostPointerSerial();
+        if (memo.memory == gpu_memory && memo.host_serial == host_serial &&
+            memo.deletions == buffer_deletions && memo.ssbo_addr == ssbo_addr &&
+            memo.flags == memo_flags && memo.cbuf_host_ptr != nullptr &&
+            static_cast<bool>(memo.binding.buffer_id) && memo.binding.segment_count == 0 &&
+            !Tegra::Nx2MayBeGpuWritten(memo.cbuf_dev, read_bytes) &&
+            !IsRegionGpuModified(memo.cbuf_dev, read_bytes)) {
+            GPUVAddr cur_gpu_addr{};
+            u64 cur_next_qword{};
+            std::memcpy(&cur_gpu_addr, memo.cbuf_host_ptr, sizeof(u64));
+            if (reads_size) {
+                std::memcpy(&cur_next_qword, memo.cbuf_host_ptr + sizeof(u64), sizeof(u64));
+            }
+            if (cur_gpu_addr == memo.gpu_addr && cur_next_qword == memo.next_qword) {
+                channel_state->storage_buffers[stage][ssbo_index] = memo.binding;
+                if (is_written && write_extent.bounded && memo.binding.size != 0 &&
+                    memo.binding.buffer_id != NULL_BUFFER_ID && Nx2DrawWriteExtents() && native &&
+                    cur_gpu_addr >= memo.binding.gpu_addr &&
+                    cur_gpu_addr - memo.binding.gpu_addr < memo.binding.size) {
+                    channel_state->graphics_storage_write_extents[stage][ssbo_index] = write_extent;
+                    channel_state->graphics_storage_write_pads[stage][ssbo_index] = memo.pad;
+                }
+                return memo.binding.buffer_id != NULL_BUFFER_ID;
+            }
+        }
+    }
     channel_state->storage_buffers[stage][ssbo_index] =
         StorageBufferBinding(ssbo_addr, cbuf_index, is_written, native || indirect, indirect,
                              false, sized);
@@ -2046,15 +2078,58 @@ bool BufferCache<P>::BindGraphicsStorageBuffer(size_t stage, size_t ssbo_index, 
         TraceTablePointer(false, stage, ssbo_index, cbuf_index, cbuf_offset, indirect_offset, holder,
                           channel_state->storage_buffers[stage][ssbo_index]);
     }
+    u32 pad_out{};
+    GPUVAddr pointer_val{};
+    bool pointer_read{};
     if (const Binding& binding = channel_state->storage_buffers[stage][ssbo_index];
         is_written && write_extent.bounded && indirect_offset == ~0U && binding.size != 0 &&
         binding.buffer_id != NULL_BUFFER_ID && Nx2DrawWriteExtents() &&
         maxwell3d->GetNativeMacroEngine().native_turing) {
-        const GPUVAddr pointer = gpu_memory->Read<u64>(ssbo_addr);
-        if (pointer >= binding.gpu_addr && pointer - binding.gpu_addr < binding.size) {
+        pointer_val = gpu_memory->Read<u64>(ssbo_addr);
+        pointer_read = true;
+        if (pointer_val >= binding.gpu_addr && pointer_val - binding.gpu_addr < binding.size) {
+            pad_out = static_cast<u32>(pointer_val - binding.gpu_addr);
             channel_state->graphics_storage_write_extents[stage][ssbo_index] = write_extent;
-            channel_state->graphics_storage_write_pads[stage][ssbo_index] =
-                static_cast<u32>(pointer - binding.gpu_addr);
+            channel_state->graphics_storage_write_pads[stage][ssbo_index] = pad_out;
+        }
+    }
+    if (!indirect && !Nx2Perf::Verify()) {
+        const bool reads_size = !native || sized;
+        const size_t read_bytes = reads_size ? 16 : 8;
+        const std::optional<DAddr> cbuf_dev =
+            ((ssbo_addr & 0xfffULL) + read_bytes) <= 0x1000ULL
+                ? gpu_memory->GpuToCpuAddress(ssbo_addr)
+                : std::nullopt;
+        const u8* const cbuf_ptr =
+            cbuf_dev ? device_memory.template GetPointer<u8>(*cbuf_dev) : nullptr;
+        if (cbuf_ptr != nullptr && !Tegra::Nx2MayBeGpuWritten(*cbuf_dev, read_bytes) &&
+            !IsRegionGpuModified(*cbuf_dev, read_bytes)) {
+            GPUVAddr cur_gpu_addr{};
+            u64 cur_next_qword{};
+            std::memcpy(&cur_gpu_addr, cbuf_ptr, sizeof(u64));
+            if (reads_size) {
+                std::memcpy(&cur_next_qword, cbuf_ptr + sizeof(u64), sizeof(u64));
+            }
+            const Binding& bound = channel_state->storage_buffers[stage][ssbo_index];
+            if (!pointer_read && bound.size != 0 && cur_gpu_addr >= bound.gpu_addr &&
+                cur_gpu_addr - bound.gpu_addr < bound.size) {
+                pad_out = static_cast<u32>(cur_gpu_addr - bound.gpu_addr);
+            }
+            memo = SsboSlotMemo{
+                .memory = gpu_memory,
+                .host_serial = gpu_memory->HostPointerSerial(),
+                .deletions = buffer_deletions,
+                .ssbo_addr = ssbo_addr,
+                .cbuf_dev = *cbuf_dev,
+                .cbuf_host_ptr = cbuf_ptr,
+                .gpu_addr = cur_gpu_addr,
+                .next_qword = cur_next_qword,
+                .flags = memo_flags,
+                .pad = pad_out,
+                .binding = bound,
+            };
+        } else {
+            memo = {};
         }
     }
     return (channel_state->storage_buffers[stage][ssbo_index].buffer_id != NULL_BUFFER_ID);
@@ -2503,7 +2578,7 @@ bool BufferCache<P>::IsRegionCpuModified(DAddr addr, size_t size) {
 template <class P>
 void BufferCache<P>::BindHostIndexBuffer() {
     Buffer& buffer = slot_buffers[channel_state->index_buffer.buffer_id];
-    TouchBuffer(buffer, channel_state->index_buffer.buffer_id);
+    TouchBufferOnce(index_touch, buffer, channel_state->index_buffer.buffer_id);
     const u32 offset = buffer.Offset(channel_state->index_buffer.device_addr);
     const u32 size = channel_state->index_buffer.size;
     const auto& draw_state = maxwell3d->draw_manager.draw_state;
@@ -2716,15 +2791,16 @@ void BufferCache<P>::BindHostVertexBuffers() {
 
 template <class P>
 void BufferCache<P>::BindHostDrawIndirectBuffers() {
-    const auto bind_buffer = [this](const Binding& binding) {
+    const auto bind_buffer = [this](const Binding& binding, TouchMemo& touch, u32 sync_slot) {
         Buffer& buffer = slot_buffers[binding.buffer_id];
-        TouchBuffer(buffer, binding.buffer_id);
-        SynchronizeBuffer(buffer, binding.device_addr, binding.size);
+        TouchBufferOnce(touch, buffer, binding.buffer_id);
+        SynchronizeGeometryBuffer(sync_slot, binding.buffer_id, binding.device_addr, binding.size);
     };
     if (current_draw_indirect->include_count) {
-        bind_buffer(channel_state->count_buffer_binding);
+        bind_buffer(channel_state->count_buffer_binding, indirect_touches[1],
+                    INDIRECT_COUNT_SYNC_SLOT);
     }
-    bind_buffer(channel_state->indirect_buffer_binding);
+    bind_buffer(channel_state->indirect_buffer_binding, indirect_touches[0], INDIRECT_SYNC_SLOT);
 }
 
 template <class P>
@@ -3068,9 +3144,15 @@ void BufferCache<P>::BindHostGraphicsStorageBuffers(size_t stage) {
             return;
         }
         Buffer& buffer = slot_buffers[binding.buffer_id];
-        TouchBuffer(buffer, binding.buffer_id);
+        TouchBufferOnce(storage_touches[stage][index], buffer, binding.buffer_id);
         const u32 size = binding.size;
-        SynchronizeBuffer(buffer, binding.device_addr, size);
+        if (index < SSBO_SYNC_PER_STAGE) {
+            SynchronizeGeometryBuffer(SSBO_SYNC_BASE + static_cast<u32>(stage) * SSBO_SYNC_PER_STAGE +
+                                          index,
+                                      binding.buffer_id, binding.device_addr, size);
+        } else {
+            SynchronizeBuffer(buffer, binding.device_addr, size);
+        }
 
         const u32 offset = buffer.Offset(binding.device_addr);
         buffer.MarkUsage(offset, size);
@@ -3462,13 +3544,25 @@ void BufferCache<P>::UpdateStorageBuffers(size_t stage) {
     if (channel_state->enabled_storage_buffers[stage] == 0) [[likely]] {
         return;
     }
+    const bool can_skip_resolved = !Settings::IsGPUFenceBehaviorAccurate() && !Nx2Perf::Verify();
     ForEachEnabledBit(channel_state->enabled_storage_buffers[stage], [&](u32 index) {
-        // Resolve buffer
         Binding& binding = channel_state->storage_buffers[stage][index];
+        if (can_skip_resolved && binding.buffer_id && binding.segment_count == 0) {
+            return;
+        }
+        // Resolve buffer
         const BufferId buffer_id = FindBuffer(binding.device_addr, binding.size, false);
         binding.buffer_id = buffer_id;
         const bool is_written = ((channel_state->written_storage_buffers[stage] >> index) & 1) != 0;
         ResolveMultiRangeStorage(binding, is_written, graphics_segments);
+        if (binding.segment_count == 0) {
+            SsboSlotMemo& memo = ssbo_slot_memos[stage][index];
+            if (memo.memory == gpu_memory && memo.binding.device_addr == binding.device_addr &&
+                memo.binding.size == binding.size) {
+                memo.deletions = buffer_deletions;
+                memo.binding.buffer_id = buffer_id;
+            }
+        }
     });
 }
 
@@ -4359,7 +4453,7 @@ void BufferCache<P>::SynchronizeGeometryBuffer(u32 slot, BufferId buffer_id, DAd
     ++geometry_stats.syncs;
     if (memory_tracker.IsSynchronized(slot) && sync.buffer_id == buffer_id &&
         sync.device_addr == device_addr && sync.size == size &&
-        sync.deletions == buffer_deletions) {
+        sync.deletions == buffer_deletions && !Nx2Owes(device_addr, size)) {
         ++geometry_stats.syncs_skipped;
         if (Nx2Perf::Verify() && !SynchronizeBuffer(buffer, device_addr, size)) {
             ++geometry_stats.verify_mismatches;

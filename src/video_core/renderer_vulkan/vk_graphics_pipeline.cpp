@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -730,6 +731,17 @@ GraphicsPipeline::GraphicsPipeline(
         unlend_texel_buffers |=
             !info.texture_buffer_descriptors.empty() || !info.image_buffer_descriptors.empty();
         unlend_images |= !info.image_descriptors.empty();
+        if (!info.storage_buffers_descriptors.empty()) {
+            storage_stage_mask |= static_cast<u8>(1u << stage);
+        }
+    }
+    if (present_stages[4]) {
+        for (const auto& desc : stage_infos[4].texture_descriptors) {
+            if (desc.type == Shader::TextureType::Color2D && !desc.is_depth && desc.count != 0) {
+                has_stage4_color2d = true;
+                break;
+            }
+        }
     }
     build.emplace(build_queue, std::move(func), std::move(emit));
 }
@@ -1300,6 +1312,45 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed, std::optional<PreparedBind
         delta_computed_handles.assign(computed_handles.begin(), computed_handles.end());
         delta_computed_values.assign(computed_values.begin(), computed_values.end());
         configured_stages = Spec::enabled_stages;
+        configured_stage_mask = 0;
+        for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+            if (configured_stages[stage]) {
+                configured_stage_mask |= static_cast<u8>(1u << stage);
+            }
+        }
+        delta_has_color_feedback = false;
+        if (configured_stages[4] && has_stage4_color2d && !mesh_emulation && !writes_images) {
+            size_t view_index{};
+            for (size_t stage = 0; stage < 4; ++stage) {
+                if (!configured_stages[stage]) {
+                    continue;
+                }
+                const auto& info = stage_infos[stage];
+                view_index += Shader::NumDescriptors(info.texture_buffer_descriptors) +
+                              Shader::NumDescriptors(info.image_buffer_descriptors) +
+                              Shader::NumDescriptors(info.texture_descriptors) +
+                              Shader::NumDescriptors(info.image_descriptors);
+            }
+            const auto& info = stage_infos[4];
+            view_index += Shader::NumDescriptors(info.texture_buffer_descriptors) +
+                          Shader::NumDescriptors(info.image_buffer_descriptors);
+            for (const auto& desc : info.texture_descriptors) {
+                for (u32 element = 0; element < desc.count; ++element, ++view_index) {
+                    if (desc.type != Shader::TextureType::Color2D || desc.is_depth ||
+                        !delta_views[view_index].id) {
+                        continue;
+                    }
+                    if (texture_cache.GetImageView(delta_views[view_index].id).format ==
+                        VideoCore::Surface::PixelFormat::A2B10G10R10_UNORM) {
+                        delta_has_color_feedback = true;
+                        break;
+                    }
+                }
+                if (delta_has_color_feedback) {
+                    break;
+                }
+            }
+        }
         delta_views_valid = true;
         kept_images_valid = false;
     }
@@ -1549,11 +1600,12 @@ bool GraphicsPipeline::ConfigureDelta(bool is_indexed, std::optional<PreparedBin
     buffer_cache.SetUniformBuffersState(enabled_uniform_buffer_masks, &uniform_buffer_sizes);
     {
         Profile::Scope scope{Profile::Zone::ReadHandles};
-        for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
-            if (!configured_stages[stage]) {
+        for (u32 mask = configured_stage_mask; mask != 0; mask &= mask - 1u) {
+            const size_t stage = static_cast<size_t>(std::countr_zero(mask));
+            buffer_cache.UnbindGraphicsStorageBuffers(stage);
+            if ((storage_stage_mask & (1u << stage)) == 0) {
                 continue;
             }
-            buffer_cache.UnbindGraphicsStorageBuffers(stage);
             size_t ssbo_index{};
             for (const auto& desc : stage_infos[stage].storage_buffers_descriptors) {
                 ASSERT(desc.count == 1);
@@ -1597,10 +1649,8 @@ bool GraphicsPipeline::ConfigureDelta(bool is_indexed, std::optional<PreparedBin
         }
         kept_image_entries.clear();
     }
-    for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
-        if (!configured_stages[stage]) {
-            continue;
-        }
+    for (u32 mask = configured_stage_mask; mask != 0; mask &= mask - 1u) {
+        const size_t stage = static_cast<size_t>(std::countr_zero(mask));
         {
             Profile::Scope scope{Profile::Zone::BindStageBuffers};
             const BufferArena::SideScope side;
@@ -1665,7 +1715,9 @@ bool GraphicsPipeline::ConfigureDelta(bool is_indexed, std::optional<PreparedBin
         texture_cache.UpdateRenderTargets(false);
         const std::span<const VideoCommon::ImageViewInOut> view_span{delta_views};
         texture_cache.CheckFeedbackLoop(view_span);
-        CheckColorFeedbackLoop(view_span, configured_stages, fragment_entry);
+        if (delta_has_color_feedback) {
+            CheckColorFeedbackLoop(view_span, configured_stages, fragment_entry);
+        }
         if (scheduler.HasFragmentBarrier() &&
             (scheduler.RenderPassHasStores() || texture_cache.SamplesRenderTarget(view_span))) {
             scheduler.RequestOutsideRenderPassOperationContext();

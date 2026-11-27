@@ -950,22 +950,48 @@ private:
     u64 vertex_buffers_serial = 0;
     std::array<Binding, 32> v_buffer{};
 
-    /// The range each geometry slot last scanned for uploads (SynchronizeGeometryBuffer).
+    /// The range each watched slot last scanned for uploads (SynchronizeGeometryBuffer).
+    /// Slots 0..NUM_VERTEX_BUFFERS-1: vertex buffers; slot NUM_VERTEX_BUFFERS: index buffer;
+    /// slots SSBO_SYNC_BASE..+24: graphics SSBOs 0..4 per stage; slots 58..59: indirect buffers.
+    static constexpr u32 INDEX_SYNC_SLOT = NUM_VERTEX_BUFFERS;
+    static constexpr u32 SSBO_SYNC_BASE = NUM_VERTEX_BUFFERS + 1;
+    static constexpr u32 SSBO_SYNC_PER_STAGE = 5;
+    static constexpr u32 INDIRECT_SYNC_SLOT = SSBO_SYNC_BASE + NUM_STAGES * SSBO_SYNC_PER_STAGE;
+    static constexpr u32 INDIRECT_COUNT_SYNC_SLOT = INDIRECT_SYNC_SLOT + 1;
+    static constexpr u32 NUM_WATCHED_SYNC_SLOTS = 64;
+    static_assert(INDIRECT_COUNT_SYNC_SLOT < NUM_WATCHED_SYNC_SLOTS);
     struct GeometrySync {
         BufferId buffer_id{};
         DAddr device_addr{};
         u32 size{};
         u64 deletions{};
     };
-    std::array<GeometrySync, NUM_VERTEX_BUFFERS + 1> geometry_syncs{};
+    std::array<GeometrySync, NUM_WATCHED_SYNC_SLOTS> geometry_syncs{};
     /// The buffer a binding slot last touched in the LRU, and in which frame (TouchBufferOnce).
     struct TouchMemo {
         u64 frame{~u64{0}};
         BufferId buffer_id{};
         u64 deletions{}; ///< buffer_deletions then: the id may be another buffer's since
     };
+    TouchMemo index_touch{};
+    std::array<TouchMemo, 2> indirect_touches{};
     std::array<TouchMemo, NUM_VERTEX_BUFFERS> vertex_touches{};
     std::array<std::array<TouchMemo, NUM_GRAPHICS_UNIFORM_BUFFERS>, NUM_STAGES> uniform_touches{};
+    std::array<std::array<TouchMemo, NUM_STORAGE_BUFFERS>, NUM_STAGES> storage_touches{};
+    struct SsboSlotMemo {
+        const Tegra::MemoryManager* memory{};
+        u64 host_serial{};
+        u64 deletions{};
+        GPUVAddr ssbo_addr{};
+        DAddr cbuf_dev{};
+        const u8* cbuf_host_ptr{};
+        GPUVAddr gpu_addr{};
+        u64 next_qword{};
+        u32 flags{};
+        u32 pad{};
+        Binding binding{};
+    };
+    std::array<std::array<SsboSlotMemo, NUM_STORAGE_BUFFERS>, NUM_STAGES> ssbo_slot_memos{};
     void TouchBufferOnce(TouchMemo& memo, Buffer& buffer, BufferId buffer_id) noexcept;
     /// FindBuffer's recent results by caching page.
     struct FindMemo {

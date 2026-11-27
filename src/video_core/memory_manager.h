@@ -142,6 +142,7 @@ public:
     /// FlushCaching hands the written ranges, merged, to the rasterizer's
     /// InvalidateConstantBufferData instead of InnerInvalidation.
     void WriteConstantBufferData(DAddr device_addr, const void* data, std::size_t size);
+    void TouchUnchangedConstantBufferData(DAddr device_addr, std::size_t size);
     /// Whether device memory at [device_addr, device_addr + size) already holds `data`.
     [[nodiscard]] bool ConstantBufferDataMatches(DAddr device_addr, const void* data,
                                                  std::size_t size);

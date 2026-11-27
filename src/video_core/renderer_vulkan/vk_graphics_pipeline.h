@@ -532,6 +532,10 @@ private:
     bool capture_delta{};
     bool verify_delta{};
     bool delta_mismatch{};
+    bool has_stage4_color2d{};
+    bool delta_has_color_feedback{};
+    u8 configured_stage_mask{};
+    u8 storage_stage_mask{};
     std::array<bool, NUM_STAGES> configured_stages{};
     std::array<u32, NUM_STAGES> handle_constant_buffers{};
     std::array<std::array<std::pair<u32, u32>, Tegra::Engines::Maxwell3D::Regs::MaxConstBuffers>,

@@ -3532,6 +3532,9 @@ private:
     void FrontCaptureMmeWrite(const FrontState& state, u32 method, u32 value, bool from_macro);
     void FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);
     bool FrontIsListIndexedDrawMacro(FrontState& state, const MacroEngine& engine, u32 start);
+    bool FrontTryFastIndexedDraw(Core::System& system, VideoCommon::GpuSplit& split,
+                                 FrontState& state, const MacroEngine& engine, u32 start);
+    void ExecuteFastIndexedDraw(Core::System& system, u32 topology, u32 count, GPUVAddr list_addr);
     bool FrontRunOnBack(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state,
                         const MacroEngine& engine, u32 start);
     u32 FrontRegister(VideoCommon::GpuSplit& split, FrontState& state, u32 method);

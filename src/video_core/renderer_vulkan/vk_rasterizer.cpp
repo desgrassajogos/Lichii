@@ -651,7 +651,8 @@ GraphicsPipeline* RasterizerVulkan::TakeReusableDraw(bool is_indexed, bool is_in
         return full(FullDraw::NoCandidate);
     }
     const auto& draw_state = maxwell3d->draw_manager.draw_state;
-    if (is_indirect || draw.is_indexed != is_indexed || draw.maxwell3d != maxwell3d ||
+    if ((is_indirect && maxwell3d->draw_manager.indirect_state.is_byte_count) ||
+        draw.is_indexed != is_indexed || draw.maxwell3d != maxwell3d ||
         draw.topology != draw_state.topology || !draw_state.inline_index_draw_indexes.empty() ||
         frame_dump.Capturing()) {
         return full(FullDraw::Kind);
@@ -749,7 +750,9 @@ void RasterizerVulkan::NoteResolvedDraw(GraphicsPipeline* pipeline, bool is_inde
     const auto& draw_state = maxwell3d->draw_manager.draw_state;
     const auto topology = draw_state.topology;
     const auto ineligible = [&]() -> std::optional<Ineligible> {
-        if (is_indirect) return Ineligible::Indirect;
+        if (is_indirect && maxwell3d->draw_manager.indirect_state.is_byte_count) {
+            return Ineligible::Indirect;
+        }
         if (mesh_draw) return Ineligible::Mesh;
         if (!pipeline->IsBuilt()) return Ineligible::NotBuilt;
         if (pipeline->WritesImages()) return Ineligible::WritesImages;
@@ -2496,6 +2499,9 @@ void RasterizerVulkan::DrawIndirect() {
         ++trace_indirect;
     }
     buffer_cache.SetDrawIndirect(&params);
+    SCOPE_EXIT {
+        buffer_cache.SetDrawIndirect(nullptr);
+    };
     PrepareDraw(params.is_indexed, [this, &params] {
         if (VideoCommon::RenderTrace::SampleFrame(render_trace_frame) && render_trace_draws <= 2048) {
             LOG_DEBUG(Render_Vulkan,
@@ -2578,7 +2584,6 @@ void RasterizerVulkan::DrawIndirect() {
                 log_params, VK_SUCCESS);
         }
     }, true);
-    buffer_cache.SetDrawIndirect(nullptr);
 }
 
 VideoCommon::OotNetwork::BypassState* RasterizerVulkan::OotNetworkBypass() {

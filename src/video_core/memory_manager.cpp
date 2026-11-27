@@ -693,6 +693,12 @@ void MemoryManager::WriteConstantBufferData(DAddr device_addr, const void* data,
     constant_buffer_writes.emplace_back(device_addr, size);
 }
 
+void MemoryManager::TouchUnchangedConstantBufferData(DAddr device_addr, std::size_t size) {
+    FinishReadsBefore(device_addr, size, true);
+    VideoCommon::GpuSplit::Get().StampWrite(device_addr, size,
+                                            VideoCommon::GpuSplit::Writer::ConstantData);
+}
+
 bool MemoryManager::ConstantBufferDataMatches(DAddr device_addr, const void* data,
                                               std::size_t size) {
     const auto* src = static_cast<const u8*>(data);

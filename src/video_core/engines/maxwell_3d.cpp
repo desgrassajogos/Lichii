@@ -1287,13 +1287,18 @@ bool Maxwell3D::WriteBoundConstantBuffer(u32 offset, const void* data, u32 bytes
     // GPU-written pages can be newer than memory, and memory can be newer than what the last full
     // resolve read (a guest CPU write, watch change or sync since, or a page CPU writes to don't
     // notify): writes there count.
-    if (Tegra::Nx2MayBeGpuWritten(device, bytes) ||
-        !memory_manager.ConstantBufferDataMatches(device, data, bytes) ||
-        !FastDraw::HandleMemoryUnchanged() || !memory_manager.IsDeviceRangeCached(device, bytes)) {
+    const bool unchanged = !Tegra::Nx2MayBeGpuWritten(device, bytes) &&
+                           memory_manager.ConstantBufferDataMatches(device, data, bytes);
+    const bool cached = memory_manager.IsDeviceRangeCached(device, bytes);
+    if (!unchanged || !FastDraw::HandleMemoryUnchanged() || !cached) {
         FastDraw::NoteConstantData(begin, begin + bytes);
         FastDraw::NoteDeviceData(device, device + bytes);
     }
-    memory_manager.WriteConstantBufferData(device, data, bytes);
+    if (!unchanged || !cached || perf_verify) {
+        memory_manager.WriteConstantBufferData(device, data, bytes);
+    } else {
+        memory_manager.TouchUnchangedConstantBufferData(device, bytes);
+    }
     return true;
 }
 
@@ -1433,6 +1438,7 @@ struct Maxwell3D::FrontState {
     bool instance_loop{};
     std::unordered_map<u32, bool> list_indexed_macros;
     u64 list_indexed_generation{~u64{0}};
+    u32 fast_indexed_macro_start{~0U};
     GPUVAddr list_indexed_draw{};
 
     /// Registers a macro the back ran may have written (FrontRunOnBack), and their shadow RAM
@@ -1985,6 +1991,14 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
                                    method, engine.native_code, engine.native_code_generation, start,
                                    fs.parameters, native_data_ram, fs.regs)
             : nullptr;
+    if (trace == nullptr && !VideoCommon::MmeCapture::active &&
+        FrontTryFastIndexedDraw(system, split, fs, engine, start)) {
+        fs.parameters.clear();
+        if (FrontVerifyEnabled() && (++fs.calls & 4095) == 0) [[unlikely]] {
+            FrontVerify(split, fs);
+        }
+        return;
+    }
     const bool on_back = FrontRunOnBack(system, split, fs, engine, start);
     if (!on_back) {
         VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Macro};
@@ -2011,7 +2025,7 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
                     [this, list = std::exchange(fs.list_indexed_draw, GPUVAddr{0})] {
                         draw_manager.draw_state.list_indexed_draw_address = list;
                     },
-                    0, VideoCommon::GpuSplit::Writes::Noted);
+                    VideoCommon::GpuSplit::FastDrawNeutral, VideoCommon::GpuSplit::Writes::Noted);
             }
             FrontWrite(split, fs, address, value, true, true);
             // MME_DMA_READ (into data RAM) and MME_DMA_READ_FIFOED (into the load FIFO).
@@ -2068,6 +2082,9 @@ bool Maxwell3D::FrontIsListIndexedDrawMacro(FrontState& fs, const MacroEngine& e
     if (fs.list_indexed_generation != engine.native_code_generation) {
         fs.list_indexed_macros.clear();
         fs.list_indexed_generation = engine.native_code_generation;
+        fs.fast_indexed_macro_start = ~0U;
+    } else if (start == fs.fast_indexed_macro_start) {
+        return true;
     }
     const auto [it, inserted] = fs.list_indexed_macros.try_emplace(start, false);
     if (!inserted) {
@@ -2082,9 +2099,124 @@ bool Maxwell3D::FrontIsListIndexedDrawMacro(FrontState& fs, const MacroEngine& e
                   ListDraw::ConstBufferOffset == MAXWELL3D_REG_INDEX(const_buffer.offset) &&
                   ListDraw::ConstBufferData == MAXWELL3D_REG_INDEX(const_buffer.buffer));
     it->second = ListDraw::IsIndexedDrawMacro(std::span<const u32>{engine.native_code}, start);
+    if (it->second) {
+        fs.fast_indexed_macro_start = start;
+    }
     LOG_INFO(HW_GPU, "Macro at {:#x} {} the indexed indirect draw (list indexed draws)", start,
              it->second ? "is" : "is not");
     return it->second;
+}
+
+bool Maxwell3D::FrontTryFastIndexedDraw(Core::System& system, VideoCommon::GpuSplit& split,
+                                        FrontState& fs, const MacroEngine& engine, u32 start) {
+    namespace ListDraw = Tegra::Nx2ListIndexedDraw;
+    if (fs.parameters.size() != 6 || !engine.native_turing || !fast_maxwell3d || perf_verify ||
+        !fs.skip_same || fs.control == Regs::ShadowRamControl::Replay) {
+        return false;
+    }
+    const u32 topology = fs.parameters[0];
+    const u32 count = fs.parameters[1];
+    const u32 instances = fs.parameters[2];
+    const u32 first = fs.parameters[3];
+    const u32 base_vertex = fs.parameters[4];
+    const u32 base_instance = fs.parameters[5];
+    if (instances != 1U || ((topology >> 26) & 3U) != 0U ||
+        (first | base_vertex | base_instance) != 0U) {
+        return false;
+    }
+    if (!FrontIsListIndexedDrawMacro(fs, engine, start)) {
+        return false;
+    }
+    constexpr std::array<u32, 10> written{
+        ListDraw::VertexIdBase,    ListDraw::BaseVertex,      ListDraw::BaseInstance,
+        ListDraw::DrawEnd,         ListDraw::DrawBegin,       ListDraw::IndexFirst,
+        ListDraw::IndexCount,      ListDraw::ConstBufferOffset, ListDraw::ConstBufferData,
+        ListDraw::ConstBufferData + 1};
+    for (const u32 reg : written) {
+        if (fs.back_owned[reg]) {
+            return false;
+        }
+    }
+    const bool tracked = fs.control == Regs::ShadowRamControl::Track ||
+                         fs.control == Regs::ShadowRamControl::TrackWithFilter;
+    if ((fs.regs[ListDraw::IndexFirst] | fs.regs[ListDraw::VertexIdBase] |
+         fs.regs[ListDraw::BaseVertex] | fs.regs[ListDraw::BaseInstance]) != 0U) {
+        return false;
+    }
+    if (tracked &&
+        (fs.shadow[ListDraw::IndexFirst] | fs.shadow[ListDraw::VertexIdBase] |
+         fs.shadow[ListDraw::BaseVertex] | fs.shadow[ListDraw::BaseInstance]) != 0U) {
+        return false;
+    }
+    if (tracked) {
+        fs.shadow[ListDraw::ConstBufferOffset] = 0x640U;
+        fs.shadow[ListDraw::ConstBufferData] = 0U;
+        fs.shadow[ListDraw::ConstBufferData + 1] = 0U;
+        fs.shadow[ListDraw::DrawBegin] = topology;
+        fs.shadow[ListDraw::IndexCount] = count;
+        fs.shadow[ListDraw::DrawEnd] = 0U;
+    }
+    fs.regs[ListDraw::ConstBufferOffset] = 0x648U;
+    fs.regs[ListDraw::ConstBufferData] = 0U;
+    fs.regs[ListDraw::ConstBufferData + 1] = 0U;
+    fs.regs[ListDraw::DrawBegin] = topology;
+    fs.regs[ListDraw::IndexCount] = count;
+    fs.regs[ListDraw::DrawEnd] = 0U;
+    fs.instance_loop = false;
+    fs.sink_pending = false;
+    fs.draw_pending = false;
+    const GPUVAddr cb_addr =
+        (GPUVAddr{fs.regs[MAXWELL3D_REG_INDEX(const_buffer.address_high)]} << 32) |
+        fs.regs[MAXWELL3D_REG_INDEX(const_buffer.address_low)];
+    const GPUVAddr list_addr = std::exchange(fs.list_indexed_draw, GPUVAddr{0});
+    split.Defer(
+        [this, system_ptr = &system, list_addr, topology, count] {
+            ExecuteFastIndexedDraw(*system_ptr, topology, count, list_addr);
+        },
+        VideoCommon::GpuSplit::FastDrawNeutral, VideoCommon::GpuSplit::Writes::Caches);
+    split.NoteWrite(memory_manager, cb_addr + 0x640U, 2 * sizeof(u32));
+    return true;
+}
+
+void Maxwell3D::ExecuteFastIndexedDraw(Core::System& system, u32 topology, u32 count,
+                                       GPUVAddr list_addr) {
+    namespace ListDraw = Tegra::Nx2ListIndexedDraw;
+    ConsumeSink(system);
+    if (draw_manager.HasDeferredDraw()) [[unlikely]] {
+        draw_manager.DrawDeferred(*this, true);
+    }
+    const auto control = shadow_state.shadow_ram_control;
+    if (control == Regs::ShadowRamControl::Track ||
+        control == Regs::ShadowRamControl::TrackWithFilter) {
+        shadow_state.reg_array[ListDraw::ConstBufferOffset] = 0x640U;
+        shadow_state.reg_array[ListDraw::ConstBufferData] = 0U;
+        shadow_state.reg_array[ListDraw::ConstBufferData + 1] = 0U;
+        shadow_state.reg_array[ListDraw::DrawBegin] = topology;
+        shadow_state.reg_array[ListDraw::IndexCount] = count;
+        shadow_state.reg_array[ListDraw::DrawEnd] = 0U;
+    }
+    regs.reg_array[ListDraw::ConstBufferOffset] = 0x640U;
+    regs.reg_array[ListDraw::ConstBufferData] = 0U;
+    regs.reg_array[ListDraw::ConstBufferData + 1] = 0U;
+    static constexpr std::array<u32, 2> zero_words{0U, 0U};
+    ProcessCBMultiData(zero_words.data(), 2);
+    regs.reg_array[ListDraw::DrawBegin] = topology;
+    regs.reg_array[ListDraw::IndexCount] = count;
+    regs.reg_array[ListDraw::DrawEnd] = 0U;
+    dirty.flags[0] = true;
+    dirty.flags[VideoCommon::Dirty::IndexBuffer] = true;
+    if (render_view_writes) [[unlikely]] {
+        VideoCommon::Nx2RenderView::NoteWrite(*render_view_writes, ListDraw::ConstBufferOffset);
+        VideoCommon::Nx2RenderView::NoteWrite(*render_view_writes, ListDraw::ConstBufferData);
+        VideoCommon::Nx2RenderView::NoteWrite(*render_view_writes, ListDraw::ConstBufferData + 1);
+        VideoCommon::Nx2RenderView::NoteWrite(*render_view_writes, ListDraw::DrawBegin);
+        VideoCommon::Nx2RenderView::NoteWrite(*render_view_writes, ListDraw::IndexCount);
+        VideoCommon::Nx2RenderView::NoteWrite(*render_view_writes, ListDraw::DrawEnd);
+    }
+    draw_manager.DrawBegin(*this);
+    draw_manager.draw_state.draw_indexed = true;
+    draw_manager.draw_state.list_indexed_draw_address = list_addr;
+    draw_manager.DrawEnd(*this);
 }
 
 bool Maxwell3D::FrontTakeListIndexedDraw(Core::System& system, VideoCommon::GpuSplit& split,

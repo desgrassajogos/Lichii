@@ -2317,6 +2317,16 @@ void TextureCache<P>::UpdateRenderTargets(bool is_clear) {
     drawing_render_targets = !is_clear;
     auto& flags = maxwell3d->dirty.flags;
     if (!flags[Dirty::RenderTargets]) {
+        if (!is_clear) {
+            for (u32 mask = rt_active_mask & ((1u << NUM_RT) - 1u); mask != 0; mask &= mask - 1u) {
+                const size_t index = static_cast<size_t>(std::countr_zero(mask));
+                PrepareImageView(render_targets.color_buffer_ids[index], true, false);
+            }
+            if ((rt_active_mask & (1u << NUM_RT)) != 0) {
+                PrepareImageView(render_targets.depth_buffer_id, true, false);
+            }
+            return;
+        }
         for (size_t index = 0; index < NUM_RT; ++index) {
             ImageViewId& color_buffer_id = render_targets.color_buffer_ids[index];
             PrepareImageView(color_buffer_id, true, is_clear && IsFullClear(color_buffer_id));
