@@ -3086,6 +3086,10 @@ public:
             /// Deferred instances already drawn by flushes in the middle of the current loop.
             u32 drawn_instances{};
             std::vector<u8> inline_index_draw_indexes;
+            /// List indexed draws (nx2_list_indexed_draw.h): the next draw.end draws the indexed
+            /// draw whose five arguments are the words at this address
+            /// (Maxwell3D::FrontTakeListIndexedDraw).
+            GPUVAddr list_indexed_draw_address{};
         };
         struct DrawTextureState {
             f32 dst_x0;
@@ -3234,6 +3238,8 @@ public:
     /// GPU thread split with macros on its front half (gpu_split.h, EDEN_NX2_SPLIT=2), called by
     /// the front instead of CallMethod: runs macros and macro uploads against a copy of the
     /// registers and sends the register writes to the back thread.
+    bool FrontTakeListIndexedDraw(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
+                                  GPUVAddr address, std::span<const u32, 5> words);
     void FrontCallMethod(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
                          u32 argument, bool is_last_call);
     void FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
@@ -3288,6 +3294,8 @@ public:
     }
 
     u32 GetMaxCurrentVertices();
+
+    u32 GetMaxStreamVertices();
 
     size_t EstimateIndexBufferSize();
 
@@ -3523,6 +3531,7 @@ private:
                     bool is_last_call, bool from_macro);
     void FrontCaptureMmeWrite(const FrontState& state, u32 method, u32 value, bool from_macro);
     void FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);
+    bool FrontIsListIndexedDrawMacro(FrontState& state, const MacroEngine& engine, u32 start);
     bool FrontRunOnBack(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state,
                         const MacroEngine& engine, u32 start);
     u32 FrontRegister(VideoCommon::GpuSplit& split, FrontState& state, u32 method);

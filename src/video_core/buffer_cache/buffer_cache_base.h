@@ -166,6 +166,9 @@ public:
     u64 native_compute_storage_buffers = 0;
     // Bytes from each compute storage binding's start that a dispatch marks GPU-written.
     std::array<u32, NUM_STORAGE_BUFFERS> compute_storage_write_marks{};
+    std::array<std::array<Shader::StorageWriteExtent, NUM_STORAGE_BUFFERS>, NUM_STAGES>
+        graphics_storage_write_extents{};
+    std::array<std::array<u32, NUM_STORAGE_BUFFERS>, NUM_STAGES> graphics_storage_write_pads{};
 
     u32 total_graphics_storage_buffers = 0;
     u32 total_compute_storage_buffers = 0;
@@ -388,7 +391,8 @@ public:
     void UnbindGraphicsStorageBuffers(size_t stage);
 
     bool BindGraphicsStorageBuffer(size_t stage, size_t ssbo_index, u32 cbuf_index, u32 cbuf_offset,
-                                   bool is_written, u32 indirect_offset = ~0U);
+                                   bool is_written, u32 indirect_offset = ~0U,
+                                   const Shader::StorageWriteExtent& write_extent = {});
 
     void UnbindGraphicsTextureBuffers(size_t stage);
 
@@ -497,6 +501,14 @@ public:
     Nx2ListRead Nx2ReadListCopy(DAddr device_addr, std::span<u8> out, bool past_sync,
                                 u64* pending_tick = nullptr);
     /// Front thread, the split drained: the command list page was flushed to guest memory.
+    [[nodiscard]] static bool Nx2DrawWriteExtents() {
+        static const bool enabled = [] {
+            const char* const value = std::getenv("EDEN_NX2_DRAW_WRITE_EXTENT");
+            return value == nullptr || value[0] != '0';
+        }();
+        return enabled;
+    }
+    bool Nx2IsDrawWrittenListPage(DAddr device_addr);
     void Nx2NoteListSynced(DAddr page);
 
     void Nx2FlushListPages(std::span<const DAddr> pages);
@@ -1375,6 +1387,7 @@ private:
     boost::container::small_vector<std::pair<BufferId, DAddr>, 8> nx2_list_copy_requests;
     boost::container::small_vector<std::pair<DAddr, u64>, 16> nx2_deferred_list_pages;
     bool nx2_collect_list_copies{};
+    bool nx2_draw_indexed{};
 };
 
 } // namespace VideoCommon
