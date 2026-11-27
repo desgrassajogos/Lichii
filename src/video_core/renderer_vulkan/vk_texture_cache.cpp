@@ -47,6 +47,7 @@
 #include "video_core/surface.h"
 #include "video_core/texture_cache/formatter.h"
 #include "video_core/texture_cache/samples_helper.h"
+#include "video_core/texture_cache/accelerated_swizzle.h"
 #include "video_core/texture_cache/util.h"
 #include "video_core/dlss_contract.h"
 #include "video_core/vulkan_common/vulkan_device.h"
@@ -1350,6 +1351,8 @@ TextureCacheRuntime::TextureCacheRuntime(const Device& device_, Scheduler& sched
         if (Settings::GetAstcRecompression() != Settings::AstcRecompression::Uncompressed) {
             bc_encoder_pass.emplace(device, scheduler, descriptor_pool,
                                     compute_pass_descriptor_queue);
+            astc_bc_pass.emplace(device, scheduler, descriptor_pool,
+                                 compute_pass_descriptor_queue);
         }
     }
     if (!device.IsKhrImageFormatListSupported()) {
@@ -5540,9 +5543,106 @@ void TextureCacheRuntime::AccelerateImageUploadLayers(
     astc_decoder_pass->AssembleLayers(image, map, swizzles, layers);
 }
 
+void TextureCacheRuntime::TranscodeAstcToBcnFused(
+    Image& image, const StagingBufferRef& map,
+    std::span<const VideoCommon::SwizzleParameters> swizzles) {
+    const ImageInfo& info = image.info;
+    const u32 width = info.size.width;
+    const u32 height = info.size.height;
+    const u32 levels = static_cast<u32>(HostMipCount(info));
+    const u32 layers = static_cast<u32>(info.resources.layers);
+    const u32 block_w = VideoCore::Surface::DefaultBlockWidth(info.format);
+    const u32 block_h = VideoCore::Surface::DefaultBlockHeight(info.format);
+    const bool bc3 = !IsOpaqueBc1Astc(device, info) &&
+                     Settings::GetAstcRecompression() != Settings::AstcRecompression::Bc1;
+    const u64 block_bytes = bc3 ? 16 : 8;
+
+    boost::container::small_vector<VideoCommon::BufferImageCopy, 16> copies;
+    u64 total = 0;
+    for (u32 level = 0; level < levels; ++level) {
+        const u32 level_width = (std::max)(width >> level, 1U);
+        const u32 level_height = (std::max)(height >> level, 1U);
+        const u32 blocks_x = Common::DivCeil(level_width, 4U);
+        const u32 blocks_y = Common::DivCeil(level_height, 4U);
+        const u64 size = u64{blocks_x} * blocks_y * layers * block_bytes;
+        copies.push_back({
+            .buffer_offset = total,
+            .buffer_size = size,
+            .buffer_row_length = blocks_x * 4,
+            .buffer_image_height = blocks_y * 4,
+            .image_subresource{
+                .base_level = static_cast<s32>(level),
+                .base_layer = 0,
+                .num_layers = static_cast<s32>(layers),
+            },
+            .image_offset{0, 0, 0},
+            .image_extent{level_width, level_height, 1},
+        });
+        total += size;
+    }
+    auto output = staging_buffer_pool.Request(total, MemoryUsage::DeviceLocal, true);
+
+    for (const VideoCommon::SwizzleParameters& swizzle : swizzles) {
+        if (swizzle.level < 0 || static_cast<u32>(swizzle.level) >= levels) {
+            continue;
+        }
+        const u32 level = static_cast<u32>(swizzle.level);
+        const u32 level_width = (std::max)(width >> level, 1U);
+        const u32 level_height = (std::max)(height >> level, 1U);
+        auto params = VideoCommon::Accelerated::MakeBlockLinearSwizzle2DParams(swizzle, info);
+        params.layer_stride = info.layer_stride;
+        const AstcBcPushConstants constants{
+            .width = level_width,
+            .height = level_height,
+            .blocks_x = Common::DivCeil(level_width, block_w),
+            .blocks_y = Common::DivCeil(level_height, block_h),
+            .srgb = VideoCore::Surface::IsPixelFormatSRGB(info.format) ? 1U : 0U,
+            .block_w = block_w,
+            .block_h = block_h,
+            .recip_w = Common::DivCeil(1U << 18, block_w),
+            .recip_h = Common::DivCeil(1U << 18, block_h),
+            .infill_ds = (1024U + block_w / 2U) / (block_w - 1U),
+            .infill_dt = (1024U + block_h / 2U) / (block_h - 1U),
+            .layer_stride = params.layer_stride,
+            .block_size = params.block_size,
+            .x_shift = params.x_shift,
+            .block_height = params.block_height,
+            .block_height_mask = params.block_height_mask,
+            .native_tiling = params.native_tiling,
+            .out_offset = static_cast<u32>(copies[level].buffer_offset / 8),
+        };
+        constexpr bool refine = false;
+        const u32 kind = bc3 ? 1U : 0U;
+        astc_bc_pass->Run(constants, kind, refine, layers, map.buffer,
+                          map.offset + swizzle.buffer_offset,
+                          image.guest_size_bytes - swizzle.buffer_offset, output.buffer,
+                          output.offset, total);
+    }
+
+    scheduler.Record([](vk::CommandBuffer cmdbuf) {
+        const VkMemoryBarrier barrier{
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .pNext = nullptr,
+            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+        };
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                               0, barrier);
+    });
+    image.UploadMemory(output.buffer, output.offset, copies);
+    staging_buffer_pool.FreeDeferred(output);
+}
+
 void TextureCacheRuntime::TranscodeAstcToBcn(
     Image& image, const StagingBufferRef& map,
     std::span<const VideoCommon::SwizzleParameters> swizzles) {
+    static const bool fused = [] {
+        const char* value = std::getenv("EDEN_NX2_ASTC_FUSED");
+        return value == nullptr || value[0] != '0';
+    }();
+    if (fused && astc_bc_pass) {
+        return TranscodeAstcToBcnFused(image, map, swizzles);
+    }
     const ImageInfo& info = image.info;
     const u32 width = info.size.width;
     const u32 height = info.size.height;

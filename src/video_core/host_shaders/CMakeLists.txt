@@ -11,12 +11,16 @@ set(FIDELITYFX_FILES
 set(GLSL_INCLUDES
     fidelityfx_fsr.frag
     ${FIDELITYFX_FILES}
+    ${CMAKE_CURRENT_SOURCE_DIR}/astc_decode.glsl
+    ${CMAKE_CURRENT_SOURCE_DIR}/bcn_encode.glsl
+    ${CMAKE_CURRENT_SOURCE_DIR}/astc_bc.glsl
 )
 
 set(SHADER_FILES
     ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_vertex_repack.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/astc_decoder.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/bc_encoder.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/astc_bc.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/blit_color_float.frag
     ${CMAKE_CURRENT_SOURCE_DIR}/blit_color_srgb_to_linear.frag
     ${CMAKE_CURRENT_SOURCE_DIR}/block_linear_unswizzle_2d.comp
@@ -182,6 +186,11 @@ foreach(SOURCE_FILE IN ITEMS ${SHADER_FILES})
         elseif (FILENAME STREQUAL "convert_abgr8_to_x8d24.frag" OR
             FILENAME STREQUAL "convert_x8d24_to_abgr8.frag")
             list(APPEND SPIRV_DEPENDENCIES ${CMAKE_CURRENT_SOURCE_DIR}/x8d24_conversion.glsl)
+        elseif (FILENAME STREQUAL "astc_bc.comp")
+            list(APPEND SPIRV_DEPENDENCIES
+                ${CMAKE_CURRENT_SOURCE_DIR}/astc_decode.glsl
+                ${CMAKE_CURRENT_SOURCE_DIR}/bcn_encode.glsl
+                ${CMAKE_CURRENT_SOURCE_DIR}/astc_bc.glsl)
         endif()
         string(TOUPPER ${SHADER_NAME}_SPV SPIRV_VARIABLE_NAME)
         set(SPIRV_HEADER_FILE ${SHADER_DIR}/${SHADER_NAME}_spv.h)

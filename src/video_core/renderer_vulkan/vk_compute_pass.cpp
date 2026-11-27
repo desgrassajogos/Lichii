@@ -18,6 +18,7 @@
 #include "common/logging.h"
 #include "common/div_ceil.h"
 #include "common/vector_math.h"
+#include "video_core/host_shaders/astc_bc_comp_spv.h"
 #include "video_core/host_shaders/astc_decoder_comp_spv.h"
 #include "video_core/host_shaders/bc_encoder_comp_spv.h"
 #include "video_core/host_shaders/queries_prefix_scan_sum_comp_spv.h"
@@ -255,7 +256,7 @@ ComputePass::ComputePass(const Device& device_, Scheduler& scheduler, Descriptor
                          const DescriptorBankInfo& bank_info,
                          vk::Span<VkPushConstantRange> push_constants, std::span<const u32> code,
                          std::optional<u32> optional_subgroup_size)
-    : device{device_} {
+    : device{device_}, required_subgroup_size{optional_subgroup_size} {
     descriptor_set_layout = device.GetLogical().CreateDescriptorSetLayout({
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
         .pNext = nullptr,
@@ -298,13 +299,17 @@ ComputePass::ComputePass(const Device& device_, Scheduler& scheduler, Descriptor
         .pCode = code.data(),
     });
     device.SaveShader(code);
+    pipeline = CreatePipeline();
+}
+
+vk::Pipeline ComputePass::CreatePipeline(const VkSpecializationInfo* spec) {
     const VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT subgroup_size_ci{
         .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT,
         .pNext = nullptr,
-        .requiredSubgroupSize = optional_subgroup_size ? *optional_subgroup_size : 32U,
+        .requiredSubgroupSize = required_subgroup_size ? *required_subgroup_size : 32U,
     };
-    bool use_setup_size = device.IsExtSubgroupSizeControlSupported() && optional_subgroup_size;
-    pipeline = device.GetLogical().CreateComputePipeline(VkComputePipelineCreateInfo{
+    const bool use_setup_size = device.IsExtSubgroupSizeControlSupported() && required_subgroup_size;
+    return device.GetLogical().CreateComputePipeline(VkComputePipelineCreateInfo{
         .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
         .pNext = nullptr,
         .flags = 0,
@@ -315,7 +320,7 @@ ComputePass::ComputePass(const Device& device_, Scheduler& scheduler, Descriptor
             .stage = VK_SHADER_STAGE_COMPUTE_BIT,
             .module = *module,
             .pName = "main",
-            .pSpecializationInfo = nullptr,
+            .pSpecializationInfo = spec,
         },
         .layout = *layout,
         .basePipelineHandle = {},
@@ -927,6 +932,59 @@ void TranscodeAstcBatches(ASTCDecoderPass& decoder, BcEncoderPass& encoder,
                            level_offsets[level] + layer_bytes[level] * base);
         }
     }
+}
+
+AstcBcPass::AstcBcPass(const Device& device_, Scheduler& scheduler_,
+                       DescriptorPool& descriptor_pool_,
+                       ComputePassDescriptorQueue& compute_pass_descriptor_queue_)
+    : ComputePass(device_, scheduler_, descriptor_pool_, INPUT_OUTPUT_DESCRIPTOR_SET_BINDINGS,
+                  INPUT_OUTPUT_DESCRIPTOR_UPDATE_TEMPLATE, INPUT_OUTPUT_BANK_INFO,
+                  COMPUTE_PUSH_CONSTANT_RANGE<sizeof(AstcBcPushConstants)>, ASTC_BC_COMP_SPV),
+      scheduler{scheduler_}, compute_pass_descriptor_queue{compute_pass_descriptor_queue_} {}
+
+AstcBcPass::~AstcBcPass() = default;
+
+VkPipeline AstcBcPass::PipelineFor(u32 kind, bool refine) {
+    const size_t slot = static_cast<size_t>(kind & 0xFU) + (refine ? 5U : 0U);
+    if (pipelines[slot]) {
+        return **pipelines[slot];
+    }
+    const std::array<u32, 2> values{kind & 0xFU, refine ? 1U : 0U};
+    const std::array<VkSpecializationMapEntry, 2> entries{{
+        {0U, 0U, sizeof(u32)},
+        {1U, sizeof(u32), sizeof(u32)},
+    }};
+    const VkSpecializationInfo spec{
+        .mapEntryCount = static_cast<u32>(entries.size()),
+        .pMapEntries = entries.data(),
+        .dataSize = sizeof(values),
+        .pData = values.data(),
+    };
+    pipelines[slot].emplace(CreatePipeline(&spec));
+    return **pipelines[slot];
+}
+
+void AstcBcPass::Run(const AstcBcPushConstants& params, u32 kind, bool refine, u32 layers,
+                     VkBuffer input, VkDeviceSize input_offset, VkDeviceSize input_size,
+                     VkBuffer output, VkDeviceSize output_offset, VkDeviceSize output_size) {
+    scheduler.RequestOutsideRenderPassOperationContext();
+    compute_pass_descriptor_queue.Acquire(scheduler, 2);
+    compute_pass_descriptor_queue.AddBuffer(input, input_offset, input_size);
+    compute_pass_descriptor_queue.AddBuffer(output, output_offset, output_size);
+    const void* const descriptor_data{compute_pass_descriptor_queue.UpdateData()};
+    const VkPipeline vk_pipeline = PipelineFor(kind, refine);
+    const bool aligned = ((params.block_w | params.block_h) & 3U) == 0U;
+    const u32 invocation_columns = aligned ? params.blocks_x : Common::DivCeil(params.width, 4U);
+    const u32 invocation_rows = aligned ? params.blocks_y : Common::DivCeil(params.height, 4U);
+    scheduler.Record([this, vk_pipeline, params, layers, invocation_columns, invocation_rows,
+                      descriptor_data](vk::CommandBuffer cmdbuf) {
+        const VkDescriptorSet set = descriptor_allocator.Commit();
+        device.GetLogical().UpdateDescriptorSet(set, *descriptor_template, descriptor_data);
+        cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, vk_pipeline);
+        cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *layout, 0, set, {});
+        cmdbuf.PushConstants(*layout, VK_SHADER_STAGE_COMPUTE_BIT, params);
+        cmdbuf.Dispatch(Common::DivCeil(invocation_columns, 64U), invocation_rows, layers);
+    });
 }
 
 constexpr u32 BL3D_BINDING_INPUT_BUFFER  = 0;
