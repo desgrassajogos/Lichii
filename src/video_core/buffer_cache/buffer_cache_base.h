@@ -475,8 +475,9 @@ public:
             return !early_pages.empty() &&
                    pending_early_downloads < MaxPendingEarlyDownloads &&
                    early_bytes_this_frame < EarlyBytesPerFrame;
+        } else {
+            return false;
         }
-        return false;
     }
     [[nodiscard]] bool Nx2HasDeferredListPages() const {
         return !nx2_deferred_list_pages.empty();

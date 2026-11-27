@@ -3894,8 +3894,10 @@ void BufferCache<P>::Nx2NoteListHostWrite(DAddr device_addr, u64 size) {
                 continue;
             }
             const DAddr page_addr = page << page_bits;
-            std::erase_if(nx2_deferred_list_pages,
-                          [page_addr](const auto& item) { return item.first == page_addr; });
+            const auto removed = std::ranges::remove_if(
+                nx2_deferred_list_pages,
+                [page_addr](const auto& item) { return item.first == page_addr; });
+            nx2_deferred_list_pages.erase(removed.begin(), removed.end());
             std::scoped_lock lock{nx2_list_mutex};
             const auto it = nx2_list_pages.find(page_addr);
             if (it == nx2_list_pages.end()) {
