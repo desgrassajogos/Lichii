@@ -1774,7 +1774,7 @@ bool RasterizerVulkan::FencePostable(VideoCommon::GpuSplit::PostedOp kind) {
     }
     {
         std::scoped_lock lock{buffer_cache.mutex};
-        if (buffer_cache.HasUncommittedFlushes()) {
+        if (buffer_cache.HasUncommittedFlushes() || buffer_cache.Nx2HasDeferredListPages()) {
             split.NoteFenceLent(GpuSplit::FenceLent::BufferHalf);
             return false;
         }
@@ -3918,6 +3918,12 @@ void RasterizerVulkan::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
         query_sync_lent_only = true;
     }
     RENDER_LEND(Query(gpu_addr, type, flags, payload, subreport))
+    if (True(flags & VideoCommon::QueryPropertiesFlags::IsAFence)) {
+        std::scoped_lock lock{buffer_cache.mutex};
+        if (buffer_cache.Nx2HasDeferredListPages()) {
+            SubmitNx2ListCopies();
+        }
+    }
     // Reports and semaphore releases reach guest memory the CPU may wait on.
     VideoCommon::Nx2FastDraw::NoteSync();
     query_cache.CounterReport(gpu_addr, type, flags, payload, subreport);
@@ -3938,6 +3944,7 @@ void RasterizerVulkan::SubmitNx2ListCopies() {
     // Batched like fences (DeferFlush): one submission per dispatch was ~6,000 a second in Hyrule
     // Warriors: Age of Imprisonment fights. A front that waits on a copy whose tick isn't
     // submitted yet has the back submit it between entries (IsGpuTickDone, WaitSubmittedTick).
+    buffer_cache.Nx2QueueDeferredListCopies();
     if (buffer_cache.Nx2CopyListPages(scheduler.CurrentTick()) && !scheduler.DeferFlush()) {
         scheduler.Flush();
     }
@@ -4114,6 +4121,13 @@ void RasterizerVulkan::Nx2CheckListSlot(u32 slot, std::span<const u32> words) {
 }
 
 void RasterizerVulkan::FlushGpuWrittenCommandListPages(std::span<const DAddr> pages) {
+    if (VideoCommon::GpuSplit::FlushesOnBack()) {
+        gpu.InvalidateGPUCache();
+        std::scoped_lock lock{buffer_cache.mutex};
+        if (buffer_cache.Nx2TryCompleteCleanListFlush(pages)) {
+            return;
+        }
+    }
     RENDER_LEND(FlushGpuWrittenCommandListPages(pages))
     gpu.InvalidateGPUCache();
     std::scoped_lock lock{buffer_cache.mutex};
@@ -4802,12 +4816,24 @@ void RasterizerVulkan::SignalFence(std::function<void()>&& func) {
         NoteSyncLent();
     }
     RENDER_LEND(SignalFence(std::move(func)))
+    {
+        std::scoped_lock lock{buffer_cache.mutex};
+        if (buffer_cache.Nx2HasDeferredListPages()) {
+            SubmitNx2ListCopies();
+        }
+    }
     VideoCommon::Nx2FastDraw::NoteSync();
     fence_manager.SignalFence(std::move(func));
 }
 
 void RasterizerVulkan::SyncOperation(std::function<void()>&& func) {
     RENDER_LEND(SyncOperation(std::move(func)))
+    {
+        std::scoped_lock lock{buffer_cache.mutex};
+        if (buffer_cache.Nx2HasDeferredListPages()) {
+            SubmitNx2ListCopies();
+        }
+    }
     VideoCommon::Nx2FastDraw::NoteSync();
     fence_manager.SyncOperation(std::move(func));
 }
@@ -4823,6 +4849,12 @@ void RasterizerVulkan::SignalSyncPoint(u32 value) {
         NoteSyncLent();
     }
     RENDER_LEND(SignalSyncPoint(value))
+    {
+        std::scoped_lock lock{buffer_cache.mutex};
+        if (buffer_cache.Nx2HasDeferredListPages()) {
+            SubmitNx2ListCopies();
+        }
+    }
     VideoCommon::Nx2FastDraw::NoteSync();
     fence_manager.SignalSyncPoint(value);
 }
@@ -4838,6 +4870,12 @@ void RasterizerVulkan::SignalReference() {
         NoteSyncLent();
     }
     RENDER_LEND(SignalReference())
+    {
+        std::scoped_lock lock{buffer_cache.mutex};
+        if (buffer_cache.Nx2HasDeferredListPages()) {
+            SubmitNx2ListCopies();
+        }
+    }
     VideoCommon::Nx2FastDraw::NoteSync();
     fence_manager.SignalReference();
 }
@@ -4858,6 +4896,12 @@ void RasterizerVulkan::ReleaseFences(bool force) {
         NoteSyncLent();
     }
     RENDER_LEND(ReleaseFences(force))
+    if (force) {
+        std::scoped_lock lock{buffer_cache.mutex};
+        if (buffer_cache.Nx2HasDeferredListPages()) {
+            SubmitNx2ListCopies();
+        }
+    }
     fence_manager.WaitPendingFences(force);
 }
 

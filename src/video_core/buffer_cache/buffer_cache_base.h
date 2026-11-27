@@ -471,8 +471,18 @@ public:
     }
     /// Pages a dispatch's NoteWorkRecorded records early downloads of.
     [[nodiscard]] bool HasEarlyDownloads() const {
-        return !early_pages.empty();
+        if constexpr (!IS_OPENGL && USE_MEMORY_MAPS) {
+            return !early_pages.empty() &&
+                   pending_early_downloads < MaxPendingEarlyDownloads &&
+                   early_bytes_this_frame < EarlyBytesPerFrame;
+        }
+        return false;
     }
+    [[nodiscard]] bool Nx2HasDeferredListPages() const {
+        return !nx2_deferred_list_pages.empty();
+    }
+    void Nx2QueueDeferredListCopies();
+    [[nodiscard]] bool Nx2TryCompleteCleanListFlush(std::span<const DAddr> pages);
     /// True when it recorded copies, which the GPU completes at `tick` (the caller submits).
     bool Nx2CopyListPages(u64 tick);
     enum class Nx2ListRead { Unknown, Copied, Synced, NeedsSync, Pending };
@@ -1280,7 +1290,7 @@ private:
     static constexpr u16 MaxUnreadWrites = 256;
     /// Learned pages; the one read longest ago makes room. Ocarina of Time reads back ~220 pages
     /// over a few seconds.
-    static constexpr size_t MaxReadBackPages = 512;
+    static constexpr size_t MaxReadBackPages = 2048;
     /// Early download bytes a frame, and early downloads not yet in guest memory: past them, reads
     /// flush on demand. These limits only decide which downloads are recorded early, never what a
     /// read finds: a read that no early download covers flushes.
@@ -1362,6 +1372,7 @@ private:
     /// Copies replaced while the GPU may still write them: freed once it is past their tick.
     std::vector<std::pair<u64, Nx2Staging>> nx2_retired_list_copies;
     boost::container::small_vector<std::pair<BufferId, DAddr>, 8> nx2_list_copy_requests;
+    boost::container::small_vector<std::pair<DAddr, u64>, 16> nx2_deferred_list_pages;
     bool nx2_collect_list_copies{};
 };
 

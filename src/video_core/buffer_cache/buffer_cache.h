@@ -3571,10 +3571,11 @@ void BufferCache<P>::Nx2NoteListWrite(BufferId buffer_id, DAddr device_addr, u64
             }
             if (word & 1) {
                 const DAddr page_addr = page << page_bits;
+                u64 current_writes{};
                 {
                     std::scoped_lock lock{nx2_list_mutex};
                     Nx2ListPage& entry = nx2_list_pages[page_addr];
-                    ++entry.writes;
+                    current_writes = ++entry.writes;
                     if (!nx2_collect_list_copies && !entry.draw_written) {
                         entry.draw_written = true;
                         LOG_INFO(HW_GPU, "Command list page {:#x} is written by draws too: its "
@@ -3584,6 +3585,14 @@ void BufferCache<P>::Nx2NoteListWrite(BufferId buffer_id, DAddr device_addr, u64
                 }
                 if (nx2_collect_list_copies) {
                     nx2_list_copy_requests.emplace_back(buffer_id, page_addr);
+                } else {
+                    auto existing = std::ranges::find(nx2_deferred_list_pages, page_addr,
+                                                      &std::pair<DAddr, u64>::first);
+                    if (existing != nx2_deferred_list_pages.end()) {
+                        existing->second = current_writes;
+                    } else {
+                        nx2_deferred_list_pages.emplace_back(page_addr, current_writes);
+                    }
                 }
                 if (Tegra::Nx2CmdPageDiag::g_enabled) {
                     Tegra::Nx2CmdPageDiag::NoteWrite(page_addr, device_addr, size,
@@ -3592,6 +3601,58 @@ void BufferCache<P>::Nx2NoteListWrite(BufferId buffer_id, DAddr device_addr, u64
             }
             ++page;
         }
+    }
+}
+
+template <class P>
+void BufferCache<P>::Nx2QueueDeferredListCopies() {
+    if constexpr (!IS_OPENGL) {
+        if (nx2_deferred_list_pages.empty()) {
+            return;
+        }
+        constexpr u64 page_size = u64{1} << Tegra::Nx2WrittenPageBits;
+        for (const auto& [page, expected_writes] : nx2_deferred_list_pages) {
+            {
+                std::scoped_lock lock{nx2_list_mutex};
+                const auto it = nx2_list_pages.find(page);
+                if (it == nx2_list_pages.end() || it->second.writes != expected_writes ||
+                    it->second.synced_writes == expected_writes ||
+                    it->second.copy_writes == expected_writes) {
+                    continue;
+                }
+            }
+            if (memory_tracker.IsRegionCpuModified(page, page_size)) {
+                continue;
+            }
+            if (!IsRegionGpuModified(page, page_size) &&
+                !memory_tracker.IsRegionGpuModified(page, page_size)) {
+                if constexpr (USE_MEMORY_MAPS) {
+                    if (!download_cpu_read_ranges) {
+                        std::scoped_lock lock{nx2_list_mutex};
+                        const auto it = nx2_list_pages.find(page);
+                        if (it != nx2_list_pages.end() && it->second.writes == expected_writes) {
+                            it->second.synced_writes = expected_writes;
+                        }
+                    }
+                }
+                continue;
+            }
+            const u64 table_page = page >> CACHING_PAGEBITS;
+            if (table_page >= page_table.size()) {
+                continue;
+            }
+            const BufferId buffer_id = page_table[table_page];
+            if (!buffer_id) {
+                continue;
+            }
+            const Buffer& buffer = slot_buffers[buffer_id];
+            if (buffer.CpuAddr() > page ||
+                buffer.CpuAddr() + buffer.SizeBytes() < page + page_size) {
+                continue;
+            }
+            nx2_list_copy_requests.emplace_back(buffer_id, page);
+        }
+        nx2_deferred_list_pages.clear();
     }
 }
 
@@ -3744,6 +3805,50 @@ void BufferCache<P>::Nx2NoteListSynced(DAddr page) {
 }
 
 template <class P>
+bool BufferCache<P>::Nx2TryCompleteCleanListFlush(std::span<const DAddr> pages) {
+    if constexpr (IS_OPENGL || !USE_MEMORY_MAPS) {
+        return false;
+    } else {
+        if (download_cpu_read_ranges) {
+            return false;
+        }
+        constexpr u64 page_size = u64{1} << Tegra::Nx2WrittenPageBits;
+        for (const DAddr page : pages) {
+            if (IsRegionGpuModified(page, page_size) ||
+                memory_tracker.IsRegionGpuModified(page, page_size)) {
+                return false;
+            }
+        }
+        boost::container::small_vector<std::pair<DAddr, u64>, 16> drawn;
+        {
+            std::scoped_lock lock{nx2_list_mutex};
+            for (const auto& [page, entry] : nx2_list_pages) {
+                if (entry.draw_written && entry.synced_writes != entry.writes) {
+                    drawn.emplace_back(page, entry.writes);
+                }
+            }
+        }
+        for (const auto& [page, _] : drawn) {
+            if (IsRegionGpuModified(page, page_size) ||
+                memory_tracker.IsRegionGpuModified(page, page_size)) {
+                return false;
+            }
+        }
+        if (!drawn.empty()) {
+            std::scoped_lock lock{nx2_list_mutex};
+            for (const auto& [page, writes] : drawn) {
+                const auto it = nx2_list_pages.find(page);
+                if (it != nx2_list_pages.end() && it->second.writes == writes) {
+                    it->second.synced_writes = writes;
+                }
+            }
+        }
+        nx2_deferred_list_pages.clear();
+        return true;
+    }
+}
+
+template <class P>
 void BufferCache<P>::Nx2FlushListPages(std::span<const DAddr> pages) {
     constexpr u64 page_size = u64{1} << Tegra::Nx2WrittenPageBits;
     boost::container::small_vector<std::pair<DAddr, u64>, 16> ranges;
@@ -3769,6 +3874,7 @@ void BufferCache<P>::Nx2FlushListPages(std::span<const DAddr> pages) {
                 it->second.synced_writes = writes;
             }
         }
+        nx2_deferred_list_pages.clear();
     }
 }
 
@@ -3787,8 +3893,11 @@ void BufferCache<P>::Nx2NoteListHostWrite(DAddr device_addr, u64 size) {
                   1)) {
                 continue;
             }
+            const DAddr page_addr = page << page_bits;
+            std::erase_if(nx2_deferred_list_pages,
+                          [page_addr](const auto& item) { return item.first == page_addr; });
             std::scoped_lock lock{nx2_list_mutex};
-            const auto it = nx2_list_pages.find(page << page_bits);
+            const auto it = nx2_list_pages.find(page_addr);
             if (it == nx2_list_pages.end()) {
                 continue;
             }

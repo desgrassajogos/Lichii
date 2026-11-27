@@ -220,8 +220,7 @@ void GpuSplit::MaybeStart(Core::System& system_) {
         const char* const spin = std::getenv("EDEN_NX2_RENDER_SPIN_US");
         const auto spin_time = spin != nullptr
                                    ? std::chrono::microseconds{std::strtoul(spin, nullptr, 10)}
-                                   : std::chrono::duration_cast<std::chrono::microseconds>(
-                                         Nx2RenderFollower::DefaultSpin);
+                                   : std::chrono::microseconds{150};
         render_overlap_entries = 0;
         render_joins = 0;
         render_parks = 0;
